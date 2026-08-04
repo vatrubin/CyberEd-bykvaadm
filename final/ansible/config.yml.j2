@@ -1,0 +1,15 @@
+db:
+  dbname: "{{ postgres_db_name }}"
+  username: "{{ postgres_db_user }}"
+  password: "{{ postgres_db_password }}"
+  host: "{{ hostvars[groups['postgres'][0]].private_ip }}"
+  port: {{ postgres_db_port }}
+redis:
+  host: "{{ hostvars[groups['redis'][0]].private_ip }}"
+  port: {{ redis_port }}
+  db: 0
+  password: "{{ redis_password }}"
+  tls:
+    enabled: false
+schedule:
+  enabled: true

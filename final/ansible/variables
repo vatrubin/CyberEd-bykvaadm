@@ -1,0 +1,17 @@
+---
+docker_registry_url: ghcr.io
+docker_registry_username: vatrubin
+docker_registry_password: token
+
+app_port: 8080
+app_container_port: 9002
+app_image: ghcr.io/company/server:test-latest
+app_container_name: web-server
+
+postgres_db_name: appdb
+postgres_db_user: appuser
+postgres_db_password: example-db-password
+postgres_db_port: 5432
+
+redis_port: 6379
+redis_password: example-redis-password

@@ -1,0 +1,363 @@
+---
+- name: Prepare app servers
+  hosts: app
+  become: true
+  gather_facts: true
+  vars_files:
+    - variables
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+  tasks:
+    - name: Install packages required for Docker repository
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - python3-debian
+        update_cache: true
+        state: present
+
+    - name: Ensure apt keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download Docker apt key
+      ansible.builtin.get_url:
+        url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+        dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Add Docker apt repository
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: deb
+        uris: "https://download.docker.com/linux/{{ ansible_distribution | lower }}"
+        suites: "{{ ansible_distribution_release }}"
+        components: stable
+        architectures: amd64
+        signed_by: /etc/apt/keyrings/docker.asc
+        state: present
+
+    - name: Install Docker and Docker Compose v2
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        update_cache: true
+        state: present
+
+    - name: Ensure Docker is running
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Login to Docker registry
+      ansible.builtin.shell: |
+        set -e
+        printf '%s' '{{ docker_registry_password }}' | docker login {{ docker_registry_url }} --username '{{ docker_registry_username }}' --password-stdin
+      args:
+        executable: /bin/bash
+      changed_when: true
+      no_log: true
+
+- name: Prepare PostgreSQL server
+  hosts: postgres
+  become: true
+  gather_facts: true
+  vars_files:
+    - variables
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+    postgres_dump_src: backup-db.gzip
+    postgres_dump_dest: /tmp/backup-db.gzip
+    postgres_dump_restore_marker: /var/lib/postgresql/.{{ postgres_db_name }}_backup_db_gzip_restored
+  tasks:
+    - name: Install packages required for PostgreSQL repository
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - gzip
+          - python3-debian
+          - python3-psycopg2
+        update_cache: true
+        state: present
+
+    - name: Ensure apt keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download PostgreSQL apt key
+      ansible.builtin.get_url:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        dest: /etc/apt/keyrings/postgresql.asc
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Add PostgreSQL apt repository
+      ansible.builtin.deb822_repository:
+        name: pgdg
+        types: deb
+        uris: http://apt.postgresql.org/pub/repos/apt
+        suites: "{{ ansible_distribution_release }}-pgdg"
+        components: main
+        signed_by: /etc/apt/keyrings/postgresql.asc
+        state: present
+
+    - name: Install latest PostgreSQL from PGDG
+      ansible.builtin.apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        update_cache: true
+        state: latest
+
+    - name: Detect installed PostgreSQL major version
+      ansible.builtin.shell: |
+        set -e
+        ls -1 /etc/postgresql | sort -V | tail -n 1
+      args:
+        executable: /bin/bash
+      register: postgres_major
+      changed_when: false
+
+    - name: Listen on private interface
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgres_major.stdout }}/main/postgresql.conf"
+        regexp: "^#?listen_addresses\\s*="
+        line: "listen_addresses = '{{ private_ip }}'"
+      notify: restart postgres
+
+    - name: Allow app servers to connect
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgres_major.stdout }}/main/pg_hba.conf"
+        line: "host {{ postgres_db_name }} {{ postgres_db_user }} {{ hostvars[item].private_ip }}/32 scram-sha-256"
+        create: false
+      loop: "{{ groups['app'] }}"
+      notify: restart postgres
+
+    - name: Ensure PostgreSQL is running
+      ansible.builtin.systemd:
+        name: postgresql
+        enabled: true
+        state: started
+
+    - name: Apply PostgreSQL config changes before DB setup
+      ansible.builtin.meta: flush_handlers
+
+    - name: Create app database user
+      ansible.builtin.command:
+        cmd: "sudo -u postgres psql -tc \"SELECT 1 FROM pg_roles WHERE rolname='{{ postgres_db_user }}'\""
+      register: postgres_user_exists
+      changed_when: false
+
+    - name: Add app database user
+      ansible.builtin.command:
+        cmd: "sudo -u postgres psql -c \"CREATE USER {{ postgres_db_user }} WITH PASSWORD '{{ postgres_db_password }}'\""
+      when: postgres_user_exists.stdout.strip() != "1"
+      no_log: true
+
+    - name: Create app database
+      ansible.builtin.command:
+        cmd: "sudo -u postgres createdb -O {{ postgres_db_user }} {{ postgres_db_name }}"
+      register: create_db
+      failed_when: create_db.rc != 0 and 'already exists' not in create_db.stderr
+      changed_when: create_db.rc == 0
+
+    - name: Check PostgreSQL dump restore marker
+      ansible.builtin.stat:
+        path: "{{ postgres_dump_restore_marker }}"
+      register: postgres_dump_marker
+
+    - name: Upload PostgreSQL dump
+      ansible.builtin.copy:
+        src: "{{ postgres_dump_src }}"
+        dest: "{{ postgres_dump_dest }}"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+
+    - name: Recreate app database before restoring dump
+      ansible.builtin.shell: |
+        set -euo pipefail
+        sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{{ postgres_db_name }}' AND pid <> pg_backend_pid()"
+        sudo -u postgres dropdb --if-exists {{ postgres_db_name | quote }}
+        sudo -u postgres createdb -O {{ postgres_db_user | quote }} {{ postgres_db_name | quote }}
+      args:
+        executable: /bin/bash
+      when: not postgres_dump_marker.stat.exists
+
+    - name: Restore PostgreSQL dump once as app user
+      ansible.builtin.shell: |
+        set -euo pipefail
+        { printf 'SET ROLE %s;\n' {{ postgres_db_user | quote }}; gzip -dc {{ postgres_dump_dest | quote }}; } | sudo -u postgres psql -v ON_ERROR_STOP=1 -d {{ postgres_db_name | quote }}
+        touch {{ postgres_dump_restore_marker | quote }}
+      args:
+        executable: /bin/bash
+        creates: "{{ postgres_dump_restore_marker }}"
+
+    - name: Verify restored PostgreSQL tables are visible to app user
+      ansible.builtin.command:
+        cmd: "sudo -u postgres psql -d {{ postgres_db_name }} -tAc \"SET ROLE {{ postgres_db_user }}; SELECT count(*) FROM pg_catalog.pg_tables WHERE schemaname = 'public';\""
+      register: postgres_restored_table_count
+      changed_when: false
+      failed_when: >
+        postgres_restored_table_count.rc != 0
+        or (postgres_restored_table_count.stdout_lines | last | int) == 0
+
+  handlers:
+    - name: restart postgres
+      ansible.builtin.systemd:
+        name: postgresql
+        state: restarted
+
+- name: Prepare Redis server
+  hosts: redis
+  become: true
+  gather_facts: false
+  vars_files:
+    - variables
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+  tasks:
+    - name: Install Redis
+      ansible.builtin.apt:
+        name: redis-server
+        update_cache: true
+        state: present
+
+    - name: Listen on private interface
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^bind "
+        line: "bind {{ private_ip }}"
+      notify: restart redis
+
+    - name: Enable Redis protected mode
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^protected-mode "
+        line: "protected-mode yes"
+      notify: restart redis
+
+    - name: Configure Redis password
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^#?\\s*requirepass\\s+"
+        line: "requirepass {{ redis_password }}"
+      no_log: true
+      notify: restart redis
+
+    - name: Ensure Redis is running
+      ansible.builtin.systemd:
+        name: redis-server
+        enabled: true
+        state: started
+
+  handlers:
+    - name: restart redis
+      ansible.builtin.systemd:
+        name: redis-server
+        state: restarted
+
+- name: Prepare nginx load balancer
+  hosts: nginx
+  become: true
+  gather_facts: false
+  vars_files:
+    - variables
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+  tasks:
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        update_cache: true
+        state: present
+
+    - name: Upload load balancer config
+      ansible.builtin.template:
+        src: nginx-app.conf.j2
+        dest: /etc/nginx/sites-available/default
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart nginx
+
+    - name: Ensure nginx is running
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: started
+
+  handlers:
+    - name: restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+
+- name: Deploy and start application
+  hosts: app
+  become: true
+  gather_facts: false
+  vars_files:
+    - variables
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+    app_dir: /opt/app
+  tasks:
+    - name: Ensure app directory exists
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Upload application config
+      ansible.builtin.template:
+        src: config.yml.j2
+        dest: "{{ app_dir }}/config.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      no_log: true
+
+    - name: Upload Docker Compose file
+      ansible.builtin.template:
+        src: docker-compose.yml.j2
+        dest: "{{ app_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Upload Docker Compose environment
+      ansible.builtin.template:
+        src: app.env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Start application
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ app_dir }}"
+      changed_when: true

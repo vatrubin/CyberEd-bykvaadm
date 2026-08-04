@@ -1,0 +1,34 @@
+services:
+  web-server:
+    image: {{ app_image }}
+    container_name: {{ app_container_name }}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    volumes:
+      - "./tls:/app/tls:ro"
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /app/logs:size=256m,uid=10001,gid=10001,mode=1770
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "{{ private_ip }}:{{ app_port }}:{{ app_container_port }}/tcp"
+    secrets:
+      - source: config_app
+        target: /app/config.yml
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      logging: "alloy"
+      service: "web-srv"
+      env: "${DEPLOY_ENV:-prod}"
+
+secrets:
+  config_app:
+    file: ${SERVER_CONFIG_FILE:-./config.yml}
